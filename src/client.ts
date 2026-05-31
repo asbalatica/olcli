@@ -29,6 +29,12 @@ export interface Project {
   trashed?: boolean;
 }
 
+export interface CreatedProject {
+  id: string;
+  name: string;
+  owner?: { email: string; firstName?: string; lastName?: string };
+}
+
 export interface ProjectInfo {
   _id: string;
   name: string;
@@ -276,7 +282,12 @@ export class OverleafClient {
 
           if (status >= 300 && status < 400 && res.headers.location && redirectsLeft > 0) {
             this.logVerbose(`${method} ${reqUrl} -> ${status} redirect -> ${res.headers.location}`);
-            const redirectUrl = new URL(res.headers.location, reqUrl).toString();
+            const redirectTarget = new URL(res.headers.location, reqUrl);
+            const redirectUrl = redirectTarget.toString();
+            if (redirectTarget.origin !== parsedUrl.origin) {
+              res.resume();
+              return reject(new Error(`Refusing to follow cross-origin redirect to ${redirectTarget.origin}`));
+            }
             res.resume();
             doRequest(redirectUrl, redirectsLeft - 1).then(resolve, reject);
             return;
@@ -422,6 +433,47 @@ export class OverleafClient {
   async getProjectById(id: string): Promise<Project | undefined> {
     const projects = await this.listProjects();
     return projects.find(p => p.id === id);
+  }
+
+  /**
+   * Create a new blank project.
+   */
+  async createProject(name: string): Promise<CreatedProject> {
+    const response = await this.httpRequest(`${this.projectUrl()}/new`, {
+      method: 'POST',
+      headers: this.getHeaders(true),
+      body: JSON.stringify({ projectName: name }),
+      expect: 'text'
+    });
+
+    this.applySetCookieHeaders(response.headers['set-cookie'] as string[] | undefined);
+
+    if (!response.ok) {
+      const body = typeof response.body === 'string' ? response.body : '';
+      throw new Error(`Failed to create project: ${response.status}${body ? ` - ${body}` : ''}`);
+    }
+
+    let data: any;
+    try {
+      data = JSON.parse(response.body as string);
+    } catch {
+      throw new Error('Failed to create project: invalid JSON response');
+    }
+
+    const id = data.project_id || data.id || data._id;
+    if (!id) {
+      throw new Error('Failed to create project: response did not include a project id');
+    }
+
+    return {
+      id,
+      name,
+      owner: data.owner ? {
+        email: data.owner.email,
+        firstName: data.owner.first_name || data.owner.firstName,
+        lastName: data.owner.last_name || data.owner.lastName
+      } : undefined
+    };
   }
 
   /**

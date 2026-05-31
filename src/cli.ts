@@ -10,8 +10,9 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 import { OverleafClient } from './client.js';
 import {
   loadIgnore,
@@ -33,10 +34,20 @@ import {
   getConfigPath,
   saveOlAuth,
   clearConfig,
+  clearSessionCookie,
   getBaseUrl,
   setBaseUrl,
   getSessionCookieName,
-  setSessionCookieName
+  setSessionCookieName,
+  BASE_PROFILE_NAME,
+  getDefaultProfileName,
+  getProfile,
+  getProfiles,
+  removeProfile,
+  setDefaultProfileName,
+  setProfile,
+  getEnvCookieVariableNames,
+  type ServerProfile
 } from './config.js';
 
 const program = new Command();
@@ -45,24 +56,93 @@ program
   .name('olcli')
   .description('Overleaf CLI - interact with Overleaf projects from the command line')
   .version(VERSION)
+  .option('-p, --profile <name>', 'Use a named server profile')
   .option('--base-url <url>', 'Overleaf instance base URL (overrides OVERLEAF_BASE_URL and config)')
   .option('--cookie-name <name>', 'Session cookie name (default: overleaf_session2, use overleaf.sid for older instances)')
   .option('--verbose', 'Print every HTTP request, status, and error response body to stderr');
 
+program.configureHelp({ showGlobalOptions: true });
+
+interface ProjectMetadata {
+  projectId?: string;
+  projectName?: string;
+  profile?: string;
+  lastPull?: string;
+  rootFolderId?: string;
+  remoteManifest?: string[];
+  [key: string]: unknown;
+}
+
+function readProjectMetadata(dir: string = '.'): ProjectMetadata | undefined {
+  const metaPath = join(dir, '.olcli.json');
+  if (!existsSync(metaPath)) {
+    return undefined;
+  }
+
+  return JSON.parse(readFileSync(metaPath, 'utf-8').replace(/^\uFEFF/, '')) as ProjectMetadata;
+}
+
+function selectedProfileName(dir: string = '.'): string {
+  const explicitProfile = program.opts().profile as string | undefined;
+  if (explicitProfile) {
+    if (!getProfile(explicitProfile)) {
+      console.error(chalk.red(`Profile not found: ${explicitProfile}`));
+      process.exit(1);
+    }
+    return explicitProfile;
+  }
+
+  const projectProfile = readProjectMetadata(dir)?.profile;
+  if (projectProfile) {
+    if (!getProfile(projectProfile)) {
+      console.error(chalk.red(`Project uses unknown profile: ${projectProfile}`));
+      console.error(chalk.dim('Run `olcli profiles list` to inspect configured profiles.'));
+      process.exit(1);
+    }
+    return projectProfile;
+  }
+
+  return getDefaultProfileName();
+}
+
+function metadataProfileField(dir: string = '.'): string | undefined {
+  const profileName = selectedProfileName(dir);
+  return profileName || undefined;
+}
+
 /**
  * Helper to get authenticated client
  */
-async function getClient(cookieOpt?: string, baseUrlOpt?: string): Promise<OverleafClient> {
-  const cookie = cookieOpt || getSessionCookie();
+async function getClient(cookieOpt?: string, baseUrlOpt?: string, dir: string = '.'): Promise<OverleafClient> {
+  const profileName = selectedProfileName(dir);
+  const baseUrl = baseUrlOpt || (program.opts().baseUrl as string | undefined) || getBaseUrl(profileName);
+  const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName(profileName);
+  const cookie = cookieOpt || getSessionCookie(cookieName, profileName);
   if (!cookie) {
     console.error(chalk.red('No session cookie found.'));
     console.error('Set one with: olcli auth --cookie <session_cookie>');
-    console.error('Or set OVERLEAF_SESSION environment variable');
+    console.error(`Or set ${getEnvCookieVariableNames(profileName).join(' / ')} in your environment`);
     console.error('Or create .olauth file in current directory');
+    console.error(`Selected profile: ${profileName}`);
     process.exit(1);
   }
-  const baseUrl = baseUrlOpt || (program.opts().baseUrl as string | undefined) || getBaseUrl();
-  const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName();
+  const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
+  if (program.opts().verbose) client.setVerbose(true);
+  return client;
+}
+
+async function getClientForProfile(profileName: string): Promise<OverleafClient> {
+  if (!getProfile(profileName)) {
+    throw new Error(`Profile not found: ${profileName}`);
+  }
+
+  const baseUrl = getBaseUrl(profileName);
+  const cookieName = getSessionCookieName(profileName);
+  const cookie = getSessionCookie(cookieName, profileName);
+  if (!cookie) {
+    throw new Error(`No session cookie found for profile: ${profileName}`);
+  }
+
   const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
   if (program.opts().verbose) client.setVerbose(true);
   return client;
@@ -74,6 +154,17 @@ async function getClient(cookieOpt?: string, baseUrlOpt?: string): Promise<Overl
 interface ResolvedProject {
   id: string;
   name: string;
+}
+
+interface ProfileProject {
+  profileName: string;
+  client: OverleafClient;
+  project: ResolvedProject;
+}
+
+interface RemoteDiff {
+  upserts: string[];
+  deletes: string[];
 }
 
 async function resolveProject(
@@ -100,7 +191,7 @@ async function resolveProject(
   // Otherwise, check for .olcli.json
   const metaPath = join(dir, '.olcli.json');
   if (existsSync(metaPath)) {
-    const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+    const meta = readProjectMetadata(dir)!;
     if (meta.projectId && meta.projectName) {
       return { id: meta.projectId, name: meta.projectName };
     }
@@ -110,6 +201,227 @@ async function resolveProject(
   throw new Error('No project specified. Provide a project name/ID or run from a synced directory.');
 }
 
+function openUrl(url: string): void {
+  const platform = process.platform;
+  const command = platform === 'win32' ? 'cmd' : platform === 'darwin' ? 'open' : 'xdg-open';
+  const args = platform === 'win32' ? ['/c', 'start', '', `"${url.replace(/"/g, '%22')}"`] : [url];
+  const child = spawn(command, args, {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true
+  });
+  child.unref();
+}
+
+function assertSafeArchiveEntryName(entryName: string): void {
+  if (
+    entryName.includes('\0') ||
+    entryName.includes('\\') ||
+    entryName.startsWith('/') ||
+    /^[A-Za-z]:/.test(entryName) ||
+    entryName.split('/').some(part => part === '' || part === '..')
+  ) {
+    throw new Error(`Unsafe archive path: ${entryName}`);
+  }
+}
+
+function safeOutputPath(rootDir: string, entryName: string): string {
+  assertSafeArchiveEntryName(entryName);
+  const root = resolve(rootDir);
+  const target = resolve(root, entryName);
+  if (target !== root && !target.startsWith(`${root}${process.platform === 'win32' ? '\\' : '/'}`)) {
+    throw new Error(`Unsafe archive path: ${entryName}`);
+  }
+  return target;
+}
+
+function readHiddenInput(prompt: string): Promise<string> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('Interactive cookie prompt requires a terminal.');
+  }
+
+  return new Promise((resolve, reject) => {
+    const stdin = process.stdin as NodeJS.ReadStream;
+    const wasRaw = stdin.isRaw;
+    let value = '';
+    let settled = false;
+
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      stdin.off('data', onData);
+      stdin.setRawMode(wasRaw);
+      stdin.pause();
+      process.stdout.write('\n');
+      if (error) {
+        reject(error);
+      } else {
+        resolve(value.trim());
+      }
+    };
+
+    const onData = (chunk: Buffer | string) => {
+      for (const char of chunk.toString('utf-8')) {
+        if (char === '\u0003') {
+          finish(new Error('Cancelled.'));
+          return;
+        }
+        if (char === '\r' || char === '\n') {
+          finish();
+          return;
+        }
+        if (char === '\u007f' || char === '\b') {
+          value = value.slice(0, -1);
+          continue;
+        }
+        if (char >= ' ') {
+          value += char;
+        }
+      }
+    };
+
+    process.stdout.write(prompt);
+    stdin.setEncoding('utf-8');
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on('data', onData);
+  });
+}
+
+function requireProfilePair(options: any): { fromProfile: string; toProfile: string } | undefined {
+  if (!options.from && !options.to) return undefined;
+  if (!options.from || !options.to) {
+    throw new Error('Use both --from <profile> and --to <profile>');
+  }
+  if (options.from === options.to) {
+    throw new Error('Source and destination profiles must be different');
+  }
+  if (!getProfile(options.from)) {
+    throw new Error(`Profile not found: ${options.from}`);
+  }
+  if (!getProfile(options.to)) {
+    throw new Error(`Profile not found: ${options.to}`);
+  }
+  return { fromProfile: options.from, toProfile: options.to };
+}
+
+async function resolveProfileProject(profileName: string, projectName: string): Promise<ProfileProject> {
+  const client = await getClientForProfile(profileName);
+  const project = await resolveProject(client, projectName);
+  return { profileName, client, project };
+}
+
+async function downloadProjectFiles(client: OverleafClient, projectId: string): Promise<Map<string, Buffer>> {
+  const AdmZip = (await import('adm-zip')).default;
+  const zip = new AdmZip(await client.downloadProject(projectId));
+  const files = new Map<string, Buffer>();
+  for (const entry of zip.getEntries()) {
+    if (!entry.isDirectory) {
+      assertSafeArchiveEntryName(entry.entryName);
+      files.set(entry.entryName, entry.getData());
+    }
+  }
+  return files;
+}
+
+function diffRemoteFiles(source: Map<string, Buffer>, destination: Map<string, Buffer>, deleteMissing: boolean): RemoteDiff {
+  const upserts: string[] = [];
+  const deletes: string[] = [];
+
+  for (const [path, sourceContent] of source) {
+    const destinationContent = destination.get(path);
+    if (!destinationContent || !destinationContent.equals(sourceContent)) {
+      upserts.push(path);
+    }
+  }
+
+  if (deleteMissing) {
+    for (const path of destination.keys()) {
+      if (!source.has(path)) {
+        deletes.push(path);
+      }
+    }
+  }
+
+  return { upserts, deletes };
+}
+
+async function applyRemoteDiff(
+  client: OverleafClient,
+  projectId: string,
+  sourceFiles: Map<string, Buffer>,
+  diff: RemoteDiff,
+  spinner?: any
+): Promise<{ uploaded: number; deleted: number }> {
+  let uploaded = 0;
+  let deleted = 0;
+
+  for (const path of diff.upserts) {
+    const content = sourceFiles.get(path);
+    if (!content) continue;
+    await client.uploadFile(projectId, null, path, content);
+    uploaded++;
+    if (spinner) spinner.text = `Uploading files... (${uploaded}/${diff.upserts.length})`;
+  }
+
+  for (const path of diff.deletes) {
+    await client.deleteByPath(projectId, path);
+    deleted++;
+    if (spinner) spinner.text = `Deleting files... (${deleted}/${diff.deletes.length})`;
+  }
+
+  return { uploaded, deleted };
+}
+
+async function copyBetweenProfiles(
+  sourceProjectName: string,
+  targetProjectName: string,
+  fromProfile: string,
+  toProfile: string,
+  options: any
+): Promise<void> {
+  const spinner = options.dryRun ? undefined : ora('Comparing profiles...').start();
+  try {
+    if (spinner) spinner.text = `Reading "${fromProfile}"...`;
+    const source = await resolveProfileProject(fromProfile, sourceProjectName);
+    const sourceFiles = await downloadProjectFiles(source.client, source.project.id);
+
+    if (spinner) spinner.text = `Reading "${toProfile}"...`;
+    const destination = await resolveProfileProject(toProfile, targetProjectName);
+    const destinationFiles = await downloadProjectFiles(destination.client, destination.project.id);
+    if (options.deleteMissing && !options.force) {
+      throw new Error('Use --force with --delete-missing to delete files on the target project');
+    }
+
+    const diff = diffRemoteFiles(sourceFiles, destinationFiles, options.deleteMissing === true);
+    if (!options.force) {
+      diff.upserts = diff.upserts.filter(path => !destinationFiles.has(path));
+    }
+
+    if (options.dryRun) {
+      console.log(chalk.bold(`Would copy "${source.project.name}" to "${destination.project.name}"`));
+      console.log(`  From: ${chalk.cyan(fromProfile)}`);
+      console.log(`  To: ${chalk.cyan(toProfile)}`);
+      console.log(`  Upload new: ${diff.upserts.length}`);
+      console.log(`  Overwrite changed: ${options.force ? 'yes' : 'no (use --force)'}`);
+      console.log(`  Delete: ${diff.deletes.length}`);
+      return;
+    }
+
+    const result = await applyRemoteDiff(destination.client, destination.project.id, sourceFiles, diff, spinner);
+    spinner?.succeed(`Copied "${source.project.name}" to "${destination.project.name}"`);
+    console.log(`  Uploaded/updated: ${result.uploaded}`);
+    console.log(`  Deleted: ${result.deleted}`);
+  } catch (error: any) {
+    if (spinner) {
+      spinner.fail(`Failed: ${error.message}`);
+    } else {
+      console.error(chalk.red(`Failed: ${error.message}`));
+    }
+    process.exit(1);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AUTH COMMANDS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,40 +429,56 @@ async function resolveProject(
 program
   .command('auth')
   .description('Authenticate with Overleaf using session cookie')
-  .option('--cookie <session>', 'Session cookie (overleaf_session2 value)')
+  .option('--cookie <session>', 'Session cookie (overleaf_session2 value; hidden prompt is used if omitted)')
   .option('--save-local', 'Save to .olauth in current directory')
   .action(async (options) => {
-    if (!options.cookie) {
+    const profileName = selectedProfileName();
+    const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName(profileName);
+    let cookie = options.cookie || getSessionCookie(cookieName, profileName);
+    let shouldSaveCookie = Boolean(options.cookie);
+
+    if (!cookie) {
       console.log(chalk.yellow('To authenticate, provide your session cookie:'));
       console.log();
       console.log('1. Log into overleaf.com in your browser');
       console.log('2. Open Developer Tools (F12) → Application → Cookies');
-      console.log('3. Find the cookie named "overleaf_session2"');
-      console.log('4. Copy its value and run:');
+      console.log(`3. Find the cookie named "${cookieName}"`);
+      console.log('4. Copy its value and paste it below.');
       console.log();
-      console.log(chalk.cyan('  olcli auth --cookie "your_session_cookie_value"'));
+      console.log(chalk.dim(`You can also set ${getEnvCookieVariableNames(profileName).join(' / ')} in your environment.`));
       console.log();
-      console.log('Or set OVERLEAF_SESSION environment variable');
-      return;
+      try {
+        cookie = await readHiddenInput(`${cookieName}: `);
+      } catch (error: any) {
+        console.error(chalk.red(error.message));
+        process.exit(1);
+      }
+      if (!cookie) {
+        console.error(chalk.red('Session cookie cannot be empty.'));
+        process.exit(1);
+      }
+      shouldSaveCookie = true;
     }
 
     const spinner = ora('Verifying session...').start();
     try {
-      const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl();
-      const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName();
-      const client = await OverleafClient.fromSessionCookie(options.cookie, baseUrl, cookieName);
+      const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl(profileName);
+      const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
       const projects = await client.listProjects();
 
-      setSessionCookie(options.cookie);
-
       if (options.saveLocal) {
-        saveOlAuth(options.cookie);
+        saveOlAuth(cookie, undefined, cookieName, profileName);
         spinner.succeed(`Authenticated! Found ${projects.length} projects. Saved to .olauth`);
+      } else if (shouldSaveCookie) {
+        setSessionCookie(cookie, profileName);
+        spinner.succeed(`Authenticated! Found ${projects.length} projects for profile "${profileName}". Saved to global config.`);
       } else {
-        spinner.succeed(`Authenticated! Found ${projects.length} projects.`);
+        spinner.succeed(`Authenticated! Found ${projects.length} projects for profile "${profileName}".`);
       }
 
-      console.log(chalk.dim(`Config saved to: ${getConfigPath()}`));
+      if (shouldSaveCookie && !options.saveLocal) {
+        console.log(chalk.dim(`Config saved to: ${getConfigPath()}`));
+      }
     } catch (error: any) {
       spinner.fail(`Authentication failed: ${error.message}`);
       process.exit(1);
@@ -161,7 +489,9 @@ program
   .command('whoami')
   .description('Show current authentication status')
   .action(async () => {
-    const cookie = getSessionCookie();
+    const profileName = selectedProfileName();
+    const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName(profileName);
+    const cookie = getSessionCookie(cookieName, profileName);
     if (!cookie) {
       console.log(chalk.yellow('Not authenticated'));
       return;
@@ -169,11 +499,10 @@ program
 
     const spinner = ora('Checking session...').start();
     try {
-      const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl();
-      const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName();
+      const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl(profileName);
       const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
       const projects = await client.listProjects();
-      spinner.succeed(`Authenticated with access to ${projects.length} projects`);
+      spinner.succeed(`Authenticated with access to ${projects.length} projects using profile "${profileName}"`);
     } catch (error: any) {
       spinner.fail(`Session invalid: ${error.message}`);
     }
@@ -181,10 +510,23 @@ program
 
 program
   .command('logout')
-  .description('Clear stored credentials')
-  .action(() => {
-    clearConfig();
-    console.log(chalk.green('Credentials cleared'));
+  .description('Clear stored credentials for the selected profile')
+  .option('--all', 'Clear all credentials and configuration')
+  .action((options) => {
+    if (options.all) {
+      clearConfig();
+      console.log(chalk.green('Credentials and configuration cleared'));
+      return;
+    }
+
+    const profileName = selectedProfileName();
+    try {
+      clearSessionCookie(profileName);
+      console.log(chalk.green(`Credentials cleared for profile "${profileName}"`));
+    } catch (error: any) {
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
   });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +570,138 @@ program
       }
     } catch (error: any) {
       spinner.fail(`Failed: ${error.message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('create <name>')
+  .description('Create a new blank project')
+  .option('--json', 'Output as JSON')
+  .option('--cookie <session>', 'Session cookie override')
+  .action(async (name, options) => {
+    const spinner = ora('Creating project...').start();
+    try {
+      const profileName = selectedProfileName();
+      const client = await getClient(options.cookie);
+      const project = await client.createProject(name);
+      setLastProject(project.id);
+
+      spinner?.stop();
+      if (options.json) {
+        console.log(JSON.stringify(project, null, 2));
+        return;
+      }
+
+      const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl(profileName);
+      console.log(chalk.green(`Created project "${project.name}"`));
+      console.log(`  ID: ${chalk.cyan(project.id)}`);
+      console.log(`  URL: ${chalk.cyan(`${baseUrl}/project/${project.id}`)}`);
+    } catch (error: any) {
+      spinner.fail(`Failed: ${error.message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('open [project]')
+  .description('Open a project in the browser')
+  .option('--print-url', 'Print the project URL without opening a browser')
+  .option('--cookie <session>', 'Session cookie override')
+  .action(async (project, options) => {
+    const spinner = options.printUrl ? undefined : ora('Opening project...').start();
+    try {
+      const profileName = selectedProfileName();
+      const client = await getClient(options.cookie);
+      const proj = await resolveProject(client, project);
+      const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl(profileName);
+      const url = `${baseUrl}/project/${proj.id}`;
+
+      spinner?.stop();
+      if (options.printUrl) {
+        console.log(url);
+        return;
+      }
+
+      openUrl(url);
+      console.log(chalk.green(`Opened "${proj.name}"`));
+      console.log(chalk.cyan(url));
+      setLastProject(proj.id);
+    } catch (error: any) {
+      if (spinner) {
+        spinner.fail(`Failed: ${error.message}`);
+      } else {
+        console.error(chalk.red(`Failed: ${error.message}`));
+      }
+      process.exit(1);
+    }
+  });
+
+program
+  .command('clone <project>')
+  .description('Clone a project from one profile to a new project on another profile')
+  .option('--from <profile>', 'Source profile (default: selected profile)')
+  .requiredOption('--to <profile>', 'Destination profile')
+  .option('--name <name>', 'Destination project name (default: source project name)')
+  .option('--dry-run', 'Show what would be cloned without creating or uploading')
+  .action(async (project, options) => {
+    const fromProfile = options.from || selectedProfileName();
+    const toProfile = options.to;
+    const spinner = options.dryRun ? undefined : ora('Preparing clone...').start();
+
+    try {
+      if (fromProfile === toProfile) {
+        throw new Error('Source and destination profiles must be different');
+      }
+      if (!getProfile(toProfile)) {
+        throw new Error(`Profile not found: ${toProfile}`);
+      }
+
+      if (spinner) spinner.text = `Connecting to source profile "${fromProfile}"...`;
+      const sourceClient = await getClientForProfile(fromProfile);
+      const sourceProject = await resolveProject(sourceClient, project);
+
+      if (spinner) spinner.text = 'Downloading source project...';
+      const zipBuffer = await sourceClient.downloadProject(sourceProject.id);
+      const AdmZip = (await import('adm-zip')).default;
+      const zip = new AdmZip(zipBuffer);
+      const entries = zip.getEntries().filter(entry => !entry.isDirectory);
+      const destinationName = options.name || sourceProject.name;
+
+      if (options.dryRun) {
+        console.log(chalk.bold(`Would clone "${sourceProject.name}"`));
+        console.log(`  From: ${chalk.cyan(fromProfile)}`);
+        console.log(`  To: ${chalk.cyan(toProfile)}`);
+        console.log(`  Destination name: ${chalk.cyan(destinationName)}`);
+        console.log(`  Files: ${entries.length}`);
+        return;
+      }
+
+      if (spinner) spinner.text = `Connecting to destination profile "${toProfile}"...`;
+      const destinationClient = await getClientForProfile(toProfile);
+
+      if (spinner) spinner.text = `Creating "${destinationName}"...`;
+      const destinationProject = await destinationClient.createProject(destinationName);
+
+      let uploaded = 0;
+      for (const entry of entries) {
+        assertSafeArchiveEntryName(entry.entryName);
+        await destinationClient.uploadFile(destinationProject.id, null, entry.entryName, entry.getData());
+        uploaded++;
+        if (spinner) spinner.text = `Uploading files... (${uploaded}/${entries.length})`;
+      }
+
+      spinner?.succeed(`Cloned "${sourceProject.name}" to "${destinationName}"`);
+      console.log(`  From: ${chalk.cyan(fromProfile)}`);
+      console.log(`  To: ${chalk.cyan(toProfile)}`);
+      console.log(`  New project ID: ${chalk.cyan(destinationProject.id)}`);
+      console.log(`  Uploaded files: ${uploaded}`);
+    } catch (error: any) {
+      if (spinner) {
+        spinner.fail(`Failed: ${error.message}`);
+      } else {
+        console.error(chalk.red(`Failed: ${error.message}`));
+      }
       process.exit(1);
     }
   });
@@ -460,8 +934,11 @@ program
       // Preserve the relative path (e.g. 'figures/fig01.png') so the file lands
       // in the correct subfolder, not in project root. uploadFile() will
       // lazy-resolve the folder tree when no folderId/tree is supplied.
-      // Normalize: strip leading './' and any leading slashes.
-      const fileName = file.replace(/^(\.\/)+/, '').replace(/^\/+/, '');
+      // Normalize: keep relative subfolders, but never send host absolute paths.
+      const fileName = (isAbsolute(file) ? basename(file) : file)
+        .replace(/\\/g, '/')
+        .replace(/^(\.\/)+/, '')
+        .replace(/^\/+/, '');
 
       // Pass folder ID or null for root folder (client will compute it)
       const folderId = options.folder || null;
@@ -557,10 +1034,28 @@ program
 
 program
   .command('pull [project] [dir]')
-  .description('Download project files to local directory')
+  .description('Download project files to local directory, or copy from one profile to another')
+  .option('--from <profile>', 'Source profile for profile-to-profile pull')
+  .option('--to <profile>', 'Target profile for profile-to-profile pull')
+  .option('--delete-missing', 'Delete target files missing from source in profile-to-profile pull')
+  .option('--dry-run', 'Show what would be copied without applying changes')
   .option('--force', 'Overwrite local files even if newer')
   .option('--cookie <session>', 'Session cookie override')
   .action(async (project, dir, options) => {
+    try {
+      const pair = requireProfilePair(options);
+      if (pair) {
+        if (!project) {
+          throw new Error('Profile-to-profile pull requires a source project name or ID');
+        }
+        await copyBetweenProfiles(project, dir || project, pair.fromProfile, pair.toProfile, options);
+        return;
+      }
+    } catch (error: any) {
+      console.error(chalk.red(`Failed: ${error.message}`));
+      process.exit(1);
+    }
+
     let targetDir = dir || '.';
     let projectId: string | undefined;
     let projectName: string | undefined;
@@ -568,7 +1063,7 @@ program
     // Check for existing .olcli.json if no project specified
     const metaPath = join(targetDir, '.olcli.json');
     if (!project && existsSync(metaPath)) {
-      const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+      const meta = readProjectMetadata(targetDir)!;
       projectId = meta.projectId;
       projectName = meta.projectName;
     } else if (!project) {
@@ -580,7 +1075,7 @@ program
 
     const spinner = ora('Fetching project...').start();
     try {
-      const client = await getClient(options.cookie);
+      const client = await getClient(options.cookie, undefined, targetDir);
 
       // Resolve project if needed
       if (!projectId) {
@@ -618,7 +1113,7 @@ program
       const localMetaPath = join(targetDir, '.olcli.json');
       let lastPull: Date | undefined;
       if (existsSync(localMetaPath)) {
-        const meta = JSON.parse(readFileSync(localMetaPath, 'utf-8'));
+        const meta = readProjectMetadata(targetDir)!;
         lastPull = meta.lastPull ? new Date(meta.lastPull) : undefined;
       }
 
@@ -630,7 +1125,7 @@ program
 
       for (const entry of entries) {
         if (!entry.isDirectory) {
-          const filePath = join(targetDir, entry.entryName);
+          const filePath = safeOutputPath(targetDir, entry.entryName);
           const fileDir = dirname(filePath);
 
           // Check if local file exists and is newer than last pull
@@ -664,6 +1159,7 @@ program
       writeFileSync(join(targetDir, '.olcli.json'), JSON.stringify({
         projectId,
         projectName,
+        profile: metadataProfileField(targetDir),
         lastPull: new Date().toISOString(),
         remoteManifest
       }, null, 2));
@@ -690,8 +1186,12 @@ program
   });
 
 program
-  .command('push [dir]')
-  .description('Upload local changes to Overleaf project')
+  .command('push [dir] [targetProject]')
+  .description('Upload local changes, or copy from one profile to another')
+  .option('--from <profile>', 'Source profile for profile-to-profile push')
+  .option('--to <profile>', 'Target profile for profile-to-profile push')
+  .option('--delete-missing', 'Delete target files missing from source in profile-to-profile push')
+  .option('--force', 'Overwrite changed files in profile-to-profile push')
   .option('--project <name>', 'Project name or ID (overrides .olcli.json)')
   .option('--all', 'Upload all files (not just changed)')
   .option('--dry-run', 'Show what would be uploaded without uploading')
@@ -700,7 +1200,27 @@ program
   .option('--no-ignore', 'Disable all ignore filtering (escape hatch — uploads everything)')
   .option('--show-ignored', 'Print files skipped by ignore rules')
   .option('--cookie <session>', 'Session cookie override')
-  .action(async (dir, options) => {
+  .action(async (dir, targetProject, options) => {
+    try {
+      const pair = requireProfilePair(options);
+      if (pair) {
+        const sourceProject = dir || options.project;
+        if (!sourceProject) {
+          throw new Error('Profile-to-profile push requires a source project name or ID');
+        }
+        await copyBetweenProfiles(sourceProject, targetProject || options.project || sourceProject, pair.fromProfile, pair.toProfile, options);
+        return;
+      }
+    } catch (error: any) {
+      console.error(chalk.red(`Failed: ${error.message}`));
+      process.exit(1);
+    }
+
+    if (targetProject) {
+      console.error(chalk.red('Unexpected target project. Use --from and --to for profile-to-profile push.'));
+      process.exit(1);
+    }
+
     const targetDir = dir || '.';
     const metaPath = join(targetDir, '.olcli.json');
 
@@ -732,7 +1252,7 @@ program
 
     const spinner = ora('Connecting...').start();
     try {
-      const client = await getClient(options.cookie);
+      const client = await getClient(options.cookie, undefined, targetDir);
 
       // Resolve project if needed
       if (!projectId) {
@@ -774,6 +1294,10 @@ program
 
           const fullPath = join(currentDir, entry.name);
           const relativePath = relativeBase ? `${relativeBase}/${entry.name}` : entry.name;
+          if (entry.isSymbolicLink()) {
+            filesIgnored.push(relativePath);
+            continue;
+          }
 
           if (entry.isDirectory()) {
             // Test directory ignore (gitignore semantics: trailing slash matches dir)
@@ -878,6 +1402,7 @@ program
       // Update last push time
       if (existsSync(metaPath)) {
         const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+        meta.profile = metadataProfileField(targetDir);
         meta.lastPush = new Date().toISOString();
         writeFileSync(metaPath, JSON.stringify(meta, null, 2));
       }
@@ -936,7 +1461,7 @@ program
 
     const spinner = ora('Connecting...').start();
     try {
-      const client = await getClient(options.cookie);
+      const client = await getClient(options.cookie, undefined, targetDir);
 
       // Resolve project
       if (!projectId) {
@@ -985,6 +1510,10 @@ program
           if (entry.name.startsWith('.')) continue;
           const fullPath = join(currentDir, entry.name);
           const relativePath = relativeBase ? `${relativeBase}/${entry.name}` : entry.name;
+          if (entry.isSymbolicLink()) {
+            filesIgnored.push(relativePath);
+            continue;
+          }
           if (entry.isDirectory()) {
             if (shouldIgnore(`${relativePath}/`, ignoreCtx)) {
               filesIgnored.push(`${relativePath}/`);
@@ -1023,6 +1552,7 @@ program
       const remoteFiles = new Map<string, Buffer>();
       for (const entry of zip.getEntries()) {
         if (!entry.isDirectory) {
+          assertSafeArchiveEntryName(entry.entryName);
           remoteFiles.set(entry.entryName, entry.getData());
         }
       }
@@ -1085,7 +1615,7 @@ program
 
       // Write remote files, but preserve local modifications
       for (const [path, remoteContent] of remoteFiles) {
-        const filePath = join(targetDir, path);
+        const filePath = safeOutputPath(targetDir, path);
         const fileDir = dirname(filePath);
         if (!existsSync(fileDir)) {
           mkdirSync(fileDir, { recursive: true });
@@ -1135,6 +1665,7 @@ program
         writeFileSync(metaPath, JSON.stringify({
           projectId,
           projectName,
+          profile: metadataProfileField(targetDir),
           lastPull: new Date().toISOString(),
           lastSync: new Date().toISOString(),
           remoteManifest: Array.from(newManifest).sort()
@@ -1195,6 +1726,116 @@ program
 // HELP
 // ─────────────────────────────────────────────────────────────────────────────
 
+const profilesCmd = program
+  .command('profiles')
+  .description('Manage named Overleaf server profiles');
+
+function formatProfile(name: string, profile: ServerProfile, defaultProfile: string): string {
+  const marker = name === defaultProfile ? chalk.green('*') : ' ';
+  const cookieMarker = profile.sessionCookie ? chalk.green('cookie saved') : chalk.dim('no saved cookie');
+  return `${marker} ${chalk.cyan(name)}  ${profile.baseUrl}  ${chalk.dim(`cookie: ${profile.cookieName || 'overleaf_session2'}`)}  ${cookieMarker}`;
+}
+
+profilesCmd
+  .command('list')
+  .alias('ls')
+  .description('List configured server profiles')
+  .action(() => {
+    const profiles = getProfiles();
+    const defaultProfile = getDefaultProfileName();
+    console.log(chalk.bold('Server profiles:'));
+    for (const [name, profile] of Object.entries(profiles)) {
+      console.log(formatProfile(name, profile, defaultProfile));
+    }
+    console.log();
+    console.log(chalk.dim('* marks the default profile'));
+  });
+
+profilesCmd
+  .command('show [name]')
+  .description('Show one server profile')
+  .action((name?: string) => {
+    const profileName = name || selectedProfileName();
+    const profile = getProfile(profileName);
+    if (!profile) {
+      console.error(chalk.red(`Profile not found: ${profileName}`));
+      process.exit(1);
+    }
+
+    console.log(chalk.bold(`Profile: ${profileName}`));
+    console.log(`  Base URL: ${chalk.cyan(profile.baseUrl)}`);
+    console.log(`  Cookie name: ${chalk.cyan(profile.cookieName || 'overleaf_session2')}`);
+    console.log(`  Saved cookie: ${profile.sessionCookie ? chalk.green('yes') : chalk.yellow('no')}`);
+    console.log(`  Default: ${getDefaultProfileName() === profileName ? chalk.green('yes') : 'no'}`);
+  });
+
+profilesCmd
+  .command('add <name> <url>')
+  .description('Add or update a server profile')
+  .option('--session-cookie-name <name>', 'Session cookie name for this server')
+  .option('--cookie <session>', 'Store a session cookie for this profile')
+  .option('--default', 'Make this the default profile')
+  .action((name: string, url: string, options) => {
+    try {
+      const profile: ServerProfile = {
+        baseUrl: url,
+        cookieName: options.sessionCookieName || getSessionCookieName(BASE_PROFILE_NAME)
+      };
+      if (options.cookie) {
+        profile.sessionCookie = options.cookie;
+      }
+
+      setProfile(name, profile);
+      if (options.default) {
+        setDefaultProfileName(name);
+      }
+    } catch (error: any) {
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+
+    console.log(chalk.green(`Profile "${name}" saved.`));
+    if (options.default) {
+      console.log(chalk.green(`Default profile set to: ${name}`));
+    }
+  });
+
+profilesCmd
+  .command('use <name>')
+  .description('Set the default server profile')
+  .action((name: string) => {
+    try {
+      setDefaultProfileName(name);
+      console.log(chalk.green(`Default profile set to: ${name}`));
+    } catch (error: any) {
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+profilesCmd
+  .command('remove <name>')
+  .alias('rm')
+  .description('Remove a server profile')
+  .action((name: string) => {
+    try {
+      if (name === BASE_PROFILE_NAME) {
+        console.error(chalk.red('The base profile cannot be removed.'));
+        process.exit(1);
+      }
+
+      if (!removeProfile(name)) {
+        console.error(chalk.red(`Profile not found: ${name}`));
+        process.exit(1);
+      }
+    } catch (error: any) {
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+
+    console.log(chalk.green(`Profile "${name}" removed.`));
+  });
+
 const configCmd = program
   .command('config')
   .description('Manage olcli configuration');
@@ -1204,29 +1845,34 @@ configCmd
   .description('Set the Overleaf instance base URL')
   .action((url: string) => {
     setBaseUrl(url);
-    console.log(chalk.green(`Base URL set to: ${url}`));
+    console.log(chalk.green(`Base URL set for "${BASE_PROFILE_NAME}" profile: ${url}`));
   });
 
 configCmd
   .command('get-url')
   .description('Get the current Overleaf instance base URL')
   .action(() => {
-    console.log(getBaseUrl());
+    console.log(getBaseUrl(selectedProfileName()));
   });
 
 configCmd
   .command('set-cookie-name <name>')
   .description('Set the session cookie name (e.g. overleaf.sid for older instances)')
   .action((name: string) => {
-    setSessionCookieName(name);
-    console.log(chalk.green(`Session cookie name set to: ${name}`));
+    try {
+      setSessionCookieName(name);
+    } catch (error: any) {
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+    console.log(chalk.green(`Session cookie name set for "${BASE_PROFILE_NAME}" profile: ${name}`));
   });
 
 configCmd
   .command('get-cookie-name')
   .description('Get the current session cookie name')
   .action(() => {
-    console.log(getSessionCookieName());
+    console.log(getSessionCookieName(selectedProfileName()));
   });
 
 program
@@ -1270,20 +1916,32 @@ program
   .command('check')
   .description('Show credential sources and config path')
   .action(() => {
+    const profileName = selectedProfileName();
+    const baseUrl = getBaseUrl(profileName);
+    const cookieName = getSessionCookieName(profileName);
+
     console.log(chalk.bold('Configuration:'));
     console.log(`  Config file: ${getConfigPath()}`);
+    console.log(`  Selected profile: ${profileName}`);
+    console.log(`  Base URL: ${baseUrl}`);
+    console.log(`  Cookie name: ${cookieName}`);
     console.log();
 
     console.log(chalk.bold('Credential sources (in order):'));
-    console.log('  1. OVERLEAF_SESSION environment variable');
-    console.log('  2. .olauth file in current directory');
-    console.log('  3. Global config file');
+    console.log(`  1. ${getEnvCookieVariableNames(profileName).join(' / ')} from environment`);
+    if (profileName === BASE_PROFILE_NAME) {
+      console.log('  2. .olauth file in current directory');
+      console.log('  3. Global config cookie');
+    } else {
+      console.log(`  2. .olauth entry for "${profileName}" in current directory`);
+      console.log('  3. Selected profile in global config file');
+    }
     console.log();
 
-    const cookie = getSessionCookie();
+    const cookie = getSessionCookie(cookieName, profileName);
     if (cookie) {
       console.log(chalk.green('✓ Session cookie found'));
-      console.log(chalk.dim(`  Value: ${cookie.substring(0, 20)}...`));
+      console.log(chalk.dim('  Value: hidden'));
     } else {
       console.log(chalk.yellow('✗ No session cookie found'));
     }

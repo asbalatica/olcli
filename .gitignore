@@ -20,10 +20,11 @@ npm-debug.log*
 
 # Environment
 .env
-.env.local
+.env.*
 
 # Auth files (don't commit credentials!)
 .olauth
+.olauth.*
 
 # Test output
 *.zip

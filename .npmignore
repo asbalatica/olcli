@@ -10,4 +10,7 @@ test/
 .DS_Store
 
 # Auth files
+.env
+.env.*
 .olauth
+.olauth.*
