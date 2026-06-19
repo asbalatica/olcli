@@ -749,7 +749,11 @@ export class OverleafClient {
       throw new Error(`Compilation failed: ${data.status}`);
     }
 
-    const pdfFile = data.outputFiles?.find((f: any) => f.type === 'pdf');
+    // Match by path 'output.pdf' — Overleaf's CLSI always names the main
+    // compile output 'output.pdf'. Matching only on type === 'pdf' can pick up
+    // figure PDFs or *-eps-converted-to.pdf intermediates. See #26.
+    const pdfFile = data.outputFiles?.find((f: any) => f.path === 'output.pdf')
+      || data.outputFiles?.find((f: any) => f.type === 'pdf');
     if (!pdfFile) {
       throw new Error('No PDF output found');
     }
@@ -2111,7 +2115,10 @@ export class OverleafClient {
     this.applySetCookieHeaders(response.headers['set-cookie'] as string[] | undefined);
 
     const data = response.body as any;
-    const pdfFile = data.outputFiles?.find((f: any) => f.type === 'pdf');
+    // Prefer 'output.pdf' (the main compile output) over any other PDF.
+    // See #26 — projects with figure PDFs could return the wrong file.
+    const pdfFile = data.outputFiles?.find((f: any) => f.path === 'output.pdf')
+      || data.outputFiles?.find((f: any) => f.type === 'pdf');
 
     // Overleaf's CDN requires ?clsiserverid=<id> for build-output downloads.
     // Without it every output (pdf/log/bbl/...) 404s. See issue #22.
