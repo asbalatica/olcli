@@ -51,7 +51,6 @@ import {
   setTimeout,
   getPasswordCredentials,
   setPasswordCredentials,
-  clearPasswordCredentials,
   type ServerProfile,
   type PasswordCredentials
 } from './config.js';
