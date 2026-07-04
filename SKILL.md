@@ -1,175 +1,153 @@
 ---
-name: overleaf
-description: Sync and manage Overleaf LaTeX projects from the command line. Pull projects locally, push changes back, compile PDFs, and download compile outputs like .bbl files for arXiv submissions. Use when working with LaTeX, Overleaf, academic papers, or arXiv.
-license: MIT
-metadata:
-  author: aloth
-  version: "1.2"
-  cli: olcli
-  install: brew tap aloth/tap && brew install olcli
+name: olcli
+description: Operate the olcli CLI, git remote helper, and olcli-mcp for Overleaf-compatible LaTeX projects. Use when Codex needs to install or verify olcli, authenticate profiles, list/create/open/clone projects, pull/push/sync files, compile PDFs, download outputs such as bbl/log/aux, manage review comments, configure self-hosted Overleaf or ShareLaTeX servers, inspect ignore rules, use Overleaf as a git remote, or troubleshoot olcli commands.
 ---
 
-# Overleaf Skill
+# olcli
 
-Manage Overleaf LaTeX projects via the `olcli` CLI.
+Manage Overleaf-compatible LaTeX projects through `olcli`, `git-remote-overleaf`,
+or `olcli-mcp`.
 
-## Installation
+## Install This Checkout
 
 ```bash
-# Homebrew (recommended)
-brew tap aloth/tap && brew install olcli
-
-# npm
-npm install -g @aloth/olcli
+npm install
+npm run build
+npm install -g .
+olcli --version
+olcli --help
 ```
 
-## Authentication
+This package installs `olcli`, `olcli-mcp`, and `git-remote-overleaf`.
 
-Get your session cookie from Overleaf:
+## Safe Defaults
 
-1. Log into [overleaf.com](https://www.overleaf.com)
-2. Open DevTools (F12) → Application → Cookies
-3. Copy the value of `overleaf_session2`
+- Do not print or repeat session cookies. Prefer `olcli auth`'s hidden prompt.
+- Use `olcli check`, `olcli whoami`, and `olcli profiles show <profile>` for diagnostics.
+- Prefer `--dry-run` before writes: `push`, `sync`, `clone`, and profile-to-profile `pull/push`.
+- Remember that `olcli sync` propagates local deletions to Overleaf unless `--no-delete` is used.
+- Use `--verbose` for failed auth, compile/download 404s, upload placement issues, or unexpected sync behavior.
+- Use `--timeout <ms>` or `olcli config set-timeout <ms>` for slow projects or self-hosted instances.
+
+## Profiles And Auth
 
 ```bash
-olcli auth --cookie "YOUR_SESSION_COOKIE"
+olcli profiles add <profile> <base-url> --session-cookie-name <cookie-name>
+olcli profiles add <profile> <base-url> --session-cookie-name <cookie-name> --default
+olcli profiles list
+olcli profiles show <profile>
+olcli profiles use <profile>
+olcli auth -p <profile>
+olcli auth -p <profile> --save-local
+olcli auth -p <profile> --email "you@example.com" --password "password"
+olcli logout -p <profile>
+olcli logout --all
 ```
 
-Verify with:
+Global flags: `-p/--profile`, `--base-url`, `--cookie-name`, `--timeout`, and `--verbose`.
+
+## Project Workflows
+
 ```bash
-olcli whoami
+olcli list
+olcli info [project]
+olcli create "Project Name"
+olcli open [project]
+olcli open [project] --print-url
 ```
 
-Debug authentication issues:
 ```bash
-olcli check
+olcli pull "Project Name" local-dir -p <profile>
+cd local-dir
+olcli push --dry-run
+olcli push
+olcli sync --dry-run
+olcli sync --no-delete
+olcli pdf -o draft.pdf
 ```
 
-Clear stored credentials:
+Inside a pulled project, `.olcli.json` lets most commands infer the project and profile.
+
+## Cross-Profile Workflows
+
 ```bash
-olcli logout
+olcli pull <source-project> <target-project> --from <source-profile> --to <target-profile> --dry-run
+olcli push <source-dir-or-project> <target-project> --from <source-profile> --to <target-profile> --dry-run
+olcli clone "Source Project" --from <source-profile> --to <target-profile> --name "Copy Name" --dry-run
 ```
 
-## Common Workflows
+Use `--delete-missing` only when the user explicitly wants target-only files removed, and pair it with a dry run first.
 
-### Pull a project to work locally
+## Git Remote Helper
+
+Use Overleaf projects as native git remotes when the user wants normal commits,
+diffs, branches, and `git push`/`git pull`.
 
 ```bash
-olcli pull "My Paper"
-cd My_Paper/
+git clone overleaf::https://www.overleaf.com/project/<id>
+cd <project>
+git add .
+git commit -m "update paper"
+git push
+git pull
 ```
 
-### Edit and sync changes
+For self-hosted instances, use the instance project URL:
 
 ```bash
-# After editing files locally
-olcli push              # Upload changes only
-olcli sync              # Bidirectional sync (pull + push, propagates local deletions)
-olcli sync --no-delete  # Sync without propagating local deletions to remote
+git clone overleaf::https://overleaf.example.edu/project/<id>
 ```
 
-### Delete or rename remote files
+Debug with `GIT_REMOTE_OVERLEAF_DEBUG=1 git push`.
+
+## Compile, Outputs, And Files
 
 ```bash
-olcli delete chapters/old.tex          # remove a file from the project
-olcli rm figures/old.pdf               # alias
-olcli rename old.tex new.tex           # rename a file
-olcli mv chapters/draft.tex chapters/intro.tex   # alias
-```
-
-### Inspect ignore rules
-
-```bash
-olcli ignored              # list active patterns (built-ins + .olignore + .olignore.local)
-olcli push --show-ignored  # see what was filtered on this run
-olcli sync --no-ignore     # escape hatch: upload everything
-```
-
-### Compile and download PDF
-
-```bash
-olcli pdf                      # Compile and download
-olcli pdf -o paper.pdf         # Custom output name
-olcli compile                  # Just compile (no download)
-```
-
-### Download .bbl for arXiv submission
-
-```bash
-olcli output bbl               # Download compiled .bbl
-olcli output bbl -o main.bbl   # Custom filename
-olcli output --list            # List all available outputs
-```
-
-### Upload figures or assets
-
-```bash
-olcli upload figure1.png "My Paper"          # Upload to project root
-olcli upload diagram.pdf                      # Auto-detect project from .olcli.json
-```
-
-### Download specific files
-
-```bash
-olcli download main.tex "My Paper"           # Download single file
-olcli zip "My Paper"                          # Download entire project as zip
-```
-
-## arXiv Submission Workflow
-
-Complete workflow for preparing an arXiv submission:
-
-```bash
-# 1. Pull your project
-olcli pull "Research Paper"
-cd Research_Paper
-
-# 2. Compile to ensure everything builds
-olcli compile
-
-# 3. Download the .bbl file (arXiv requires .bbl, not .bib)
+olcli compile [project]
+olcli pdf [project] -o draft.pdf
+olcli output --list --project "Project Name"
 olcli output bbl -o main.bbl
-
-# 4. Download any other needed outputs
-olcli output aux -o main.aux    # If needed
-
-# 5. Package for submission
-zip arxiv.zip *.tex main.bbl figures/*.pdf
-
-# 6. Verify the package compiles locally (optional)
-# Then upload arxiv.zip to arxiv.org
+olcli output log -o output.log
+olcli zip [project] -o project.zip
 ```
 
-## Commands Reference
+```bash
+olcli upload figures/diagram.png [project]
+olcli download main.tex [project] -o main.tex
+olcli delete chapters/old.tex [project]
+olcli rename old.tex new.tex [project]
+olcli ignored
+olcli push --show-ignored
+```
 
-| Command | Description |
-|---------|-------------|
-| `olcli auth --cookie <value>` | Authenticate with session cookie |
-| `olcli whoami` | Check authentication status |
-| `olcli logout` | Clear stored credentials |
-| `olcli check` | Show config paths and credential sources |
-| `olcli list` | List all projects |
-| `olcli info [project]` | Show project details |
-| `olcli pull [project] [dir]` | Download project files |
-| `olcli push [dir]` | Upload local changes |
-| `olcli sync [dir]` | Bidirectional sync |
-| `olcli upload <file> [project]` | Upload a single file |
-| `olcli download <file> [project]` | Download a single file |
-| `olcli delete <file> [project]` | Delete a remote file or folder by path (alias: `rm`) |
-| `olcli rename <old> <new> [project]` | Rename a remote file or folder (alias: `mv`) |
-| `olcli ignored [dir]` | List active ignore patterns |
-| `olcli zip [project]` | Download as zip archive |
-| `olcli compile [project]` | Trigger compilation |
-| `olcli pdf [project]` | Compile and download PDF |
-| `olcli output [type]` | Download compile outputs |
+## Review Comments
 
-## Tips
+```bash
+olcli comments list [project] --status open --context 2
+olcli comments add main.tex "Please clarify this claim." [project] --text "selected source text"
+olcli comments add main.tex "Revise this sentence." [project] --line 42 --column 1 --length 80
+olcli comments reply <threadId> "Updated the paragraph." [project]
+olcli comments resolve <threadId> [project]
+olcli comments reopen <threadId> [project]
+olcli comments delete <threadId> [project]
+```
 
-- **Auto-detect project**: Run commands from a synced directory (contains `.olcli.json`) to skip the project argument
-- **Dry run**: Use `olcli push --dry-run` or `olcli sync --dry-run` to preview before applying
-- **Force overwrite**: Use `olcli pull --force` to overwrite local changes
-- **Two-way deletes**: `olcli sync` propagates *local* deletions to the remote; use `--no-delete` to opt out per run
-- **Build artifacts**: `.aux`, `.bbl`, `.log`, `.synctex.gz` etc. are filtered by default. Add custom patterns to a `.olignore` file (gitignore-style)
-- **PDF rule**: `thesis.pdf` next to `thesis.tex` is auto-ignored; standalone `figures/diagram.pdf` is preserved
-- **Project ID**: You can use project ID instead of name (24-char hex from URL)
-- **Debug auth**: Run `olcli check` to see where credentials are loaded from
+Prefer resolving comments over permanently deleting them unless deletion is explicitly requested.
+
+## MCP Server
+
+`olcli-mcp` starts a stdio MCP server. Configure MCP clients to run the installed local fork:
+
+```json
+{
+  "mcpServers": {
+    "overleaf": {
+      "command": "olcli-mcp",
+      "env": {
+        "OVERLEAF_SESSION": "<session-cookie>",
+        "OVERLEAF_BASE_URL": "https://www.overleaf.com"
+      }
+    }
+  }
+}
+```

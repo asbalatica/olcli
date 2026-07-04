@@ -31,6 +31,14 @@ interface OlcliConfig {
   sessionCookieName?: string;
   defaultProfile?: string;
   profiles?: Record<string, ServerProfile>;
+  timeout?: number;
+  loginEmail?: string;
+  loginPassword?: string;
+}
+
+export interface PasswordCredentials {
+  email: string;
+  password: string;
 }
 
 const config = new Conf<OlcliConfig>({
@@ -54,7 +62,10 @@ const config = new Conf<OlcliConfig>({
         required: ['baseUrl'],
         additionalProperties: false
       }
-    }
+    },
+    timeout: { type: 'number' },
+    loginEmail: { type: 'string' },
+    loginPassword: { type: 'string' }
   }
 });
 
@@ -204,6 +215,31 @@ export function getBaseUrl(profileName?: string): string {
 
 export function setBaseUrl(url: string): void {
   config.set('baseUrl', url);
+}
+
+export function getTimeout(): number {
+  return Number.parseInt(process.env.OVERLEAF_TIMEOUT || '') || config.get('timeout') || 10000;
+}
+
+export function setTimeout(ms: number): void {
+  config.set('timeout', ms);
+}
+
+export function getPasswordCredentials(): PasswordCredentials | undefined {
+  const email = process.env.OVERLEAF_EMAIL || config.get('loginEmail');
+  const password = process.env.OVERLEAF_PASSWORD || config.get('loginPassword');
+  if (!email || !password) return undefined;
+  return { email, password };
+}
+
+export function setPasswordCredentials(email: string, password: string): void {
+  config.set('loginEmail', email);
+  config.set('loginPassword', password);
+}
+
+export function clearPasswordCredentials(): void {
+  config.delete('loginEmail');
+  config.delete('loginPassword');
 }
 
 export function getSessionCookieName(profileName?: string): string {

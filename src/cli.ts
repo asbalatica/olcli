@@ -47,7 +47,13 @@ import {
   setDefaultProfileName,
   setProfile,
   getEnvCookieVariableNames,
-  type ServerProfile
+  getTimeout,
+  setTimeout,
+  getPasswordCredentials,
+  setPasswordCredentials,
+  clearPasswordCredentials,
+  type ServerProfile,
+  type PasswordCredentials
 } from './config.js';
 
 const program = new Command();
@@ -59,6 +65,7 @@ program
   .option('-p, --profile <name>', 'Use a named server profile')
   .option('--base-url <url>', 'Overleaf instance base URL (overrides OVERLEAF_BASE_URL and config)')
   .option('--cookie-name <name>', 'Session cookie name (default: overleaf_session2, use overleaf.sid for older instances)')
+  .option('--timeout <ms>', 'HTTP request timeout in milliseconds', parseInt)
   .option('--verbose', 'Print every HTTP request, status, and error response body to stderr');
 
 program.configureHelp({ showGlobalOptions: true });
@@ -118,17 +125,28 @@ async function getClient(cookieOpt?: string, baseUrlOpt?: string, dir: string = 
   const baseUrl = baseUrlOpt || (program.opts().baseUrl as string | undefined) || getBaseUrl(profileName);
   const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName(profileName);
   const cookie = cookieOpt || getSessionCookie(cookieName, profileName);
-  if (!cookie) {
-    console.error(chalk.red('No session cookie found.'));
-    console.error('Set one with: olcli auth --cookie <session_cookie>');
-    console.error(`Or set ${getEnvCookieVariableNames(profileName).join(' / ')} in your environment`);
-    console.error('Or create .olauth file in current directory');
-    console.error(`Selected profile: ${profileName}`);
-    process.exit(1);
+  const passwordCredentials = cookieOpt ? undefined : getPasswordCredentials();
+
+  if (cookie) {
+    try {
+      const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
+      return configureClient(client);
+    } catch (error) {
+      if (!passwordCredentials) throw error;
+    }
   }
-  const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
-  if (program.opts().verbose) client.setVerbose(true);
-  return client;
+
+  if (passwordCredentials) {
+    return loginWithSavedPassword(passwordCredentials, baseUrl, cookieName, profileName);
+  }
+
+  console.error(chalk.red('No session cookie or password credentials found.'));
+  console.error('Set one with: olcli auth --cookie <session_cookie>');
+  console.error('Or use: olcli auth --email <email> --password <password>');
+  console.error(`Or set ${getEnvCookieVariableNames(profileName).join(' / ')} in your environment`);
+  console.error('Or create .olauth file in current directory');
+  console.error(`Selected profile: ${profileName}`);
+  process.exit(1);
 }
 
 async function getClientForProfile(profileName: string): Promise<OverleafClient> {
@@ -139,13 +157,63 @@ async function getClientForProfile(profileName: string): Promise<OverleafClient>
   const baseUrl = getBaseUrl(profileName);
   const cookieName = getSessionCookieName(profileName);
   const cookie = getSessionCookie(cookieName, profileName);
-  if (!cookie) {
-    throw new Error(`No session cookie found for profile: ${profileName}`);
+  const passwordCredentials = getPasswordCredentials();
+
+  if (cookie) {
+    try {
+      const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
+      return configureClient(client);
+    } catch (error) {
+      if (!passwordCredentials) throw error;
+    }
   }
 
-  const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
+  if (passwordCredentials) {
+    return loginWithSavedPassword(passwordCredentials, baseUrl, cookieName, profileName);
+  }
+
+  throw new Error(`No session cookie or password credentials found for profile: ${profileName}`);
+}
+
+function configureClient(client: OverleafClient): OverleafClient {
   if (program.opts().verbose) client.setVerbose(true);
+  const timeout = (program.opts().timeout as number | undefined) || getTimeout();
+  client.setGlobalTimeout(timeout);
   return client;
+}
+
+async function loginWithSavedPassword(
+  credentials: PasswordCredentials,
+  baseUrl: string,
+  cookieName: string,
+  profileName: string
+): Promise<OverleafClient> {
+  const client = await OverleafClient.fromPasswordLogin(credentials.email, credentials.password, baseUrl);
+  persistClientSession(client, cookieName, profileName);
+  return configureClient(client);
+}
+
+function persistClientSession(client: OverleafClient, preferredCookieName: string, profileName: string): void {
+  const sessionCookie = client.getSessionCookiePair(preferredCookieName);
+  if (!sessionCookie) {
+    throw new Error('Password login succeeded, but no session cookie was returned.');
+  }
+
+  if (profileName === BASE_PROFILE_NAME) {
+    setSessionCookieName(sessionCookie.name);
+    setSessionCookie(sessionCookie.value, profileName);
+    return;
+  }
+
+  const profile = getProfile(profileName);
+  if (!profile) {
+    throw new Error(`Profile not found: ${profileName}`);
+  }
+  setProfile(profileName, {
+    ...profile,
+    cookieName: sessionCookie.name,
+    sessionCookie: sessionCookie.value
+  });
 }
 
 /**
@@ -428,16 +496,30 @@ async function copyBetweenProfiles(
 
 program
   .command('auth')
-  .description('Authenticate with Overleaf using session cookie')
+  .description('Authenticate with Overleaf using a session cookie or email/password')
   .option('--cookie <session>', 'Session cookie (overleaf_session2 value; hidden prompt is used if omitted)')
+  .option('--email <email>', 'Account email for password login')
+  .option('--password <password>', 'Account password for password login')
+  .option('--no-save-password', 'Do not persist email/password credentials')
   .option('--save-local', 'Save to .olauth in current directory')
   .action(async (options) => {
     const profileName = selectedProfileName();
     const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName(profileName);
-    let cookie = options.cookie || getSessionCookie(cookieName, profileName);
+
+    if (options.cookie && (options.email || options.password)) {
+      console.error(chalk.red('Use either --cookie or --email/--password, not both.'));
+      process.exit(1);
+    }
+
+    if ((options.email || options.password) && (!options.email || !options.password)) {
+      console.error(chalk.red('Both --email and --password are required for password login.'));
+      process.exit(1);
+    }
+
+    let cookie = options.cookie || (!options.email && !options.password ? getSessionCookie(cookieName, profileName) : undefined);
     let shouldSaveCookie = Boolean(options.cookie);
 
-    if (!cookie) {
+    if (!cookie && !options.email && !options.password) {
       console.log(chalk.yellow('To authenticate, provide your session cookie:'));
       console.log();
       console.log('1. Log into overleaf.com in your browser');
@@ -446,6 +528,7 @@ program
       console.log('4. Copy its value and paste it below.');
       console.log();
       console.log(chalk.dim(`You can also set ${getEnvCookieVariableNames(profileName).join(' / ')} in your environment.`));
+      console.log(chalk.dim('Or log in with email/password: olcli auth --email "you@example.com" --password "your_password"'));
       console.log();
       try {
         cookie = await readHiddenInput(`${cookieName}: `);
@@ -463,20 +546,39 @@ program
     const spinner = ora('Verifying session...').start();
     try {
       const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl(profileName);
-      const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
-      const projects = await client.listProjects();
 
-      if (options.saveLocal) {
-        saveOlAuth(cookie, undefined, cookieName, profileName);
-        spinner.succeed(`Authenticated! Found ${projects.length} projects. Saved to .olauth`);
-      } else if (shouldSaveCookie) {
-        setSessionCookie(cookie, profileName);
-        spinner.succeed(`Authenticated! Found ${projects.length} projects for profile "${profileName}". Saved to global config.`);
+      if (cookie) {
+        const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
+        configureClient(client);
+        const projects = await client.listProjects();
+
+        if (options.saveLocal) {
+          saveOlAuth(cookie, undefined, cookieName, profileName);
+          spinner.succeed(`Authenticated! Found ${projects.length} projects. Saved to .olauth`);
+        } else if (shouldSaveCookie) {
+          setSessionCookie(cookie, profileName);
+          spinner.succeed(`Authenticated! Found ${projects.length} projects for profile "${profileName}". Saved to global config.`);
+        } else {
+          spinner.succeed(`Authenticated! Found ${projects.length} projects for profile "${profileName}".`);
+        }
       } else {
-        spinner.succeed(`Authenticated! Found ${projects.length} projects for profile "${profileName}".`);
+        spinner.text = 'Logging in with email/password...';
+        const client = await OverleafClient.fromPasswordLogin(options.email, options.password, baseUrl);
+        configureClient(client);
+        const projects = await client.listProjects();
+        persistClientSession(client, cookieName, profileName);
+        if (profileName === BASE_PROFILE_NAME) {
+          setBaseUrl(baseUrl);
+        }
+        if (options.savePassword !== false) {
+          setPasswordCredentials(options.email, options.password);
+        }
+
+        const savedText = options.savePassword === false ? '' : ' Password login saved.';
+        spinner.succeed(`Authenticated! Found ${projects.length} projects for profile "${profileName}".${savedText}`);
       }
 
-      if (shouldSaveCookie && !options.saveLocal) {
+      if ((shouldSaveCookie || (!cookie && options.savePassword !== false)) && !options.saveLocal) {
         console.log(chalk.dim(`Config saved to: ${getConfigPath()}`));
       }
     } catch (error: any) {
@@ -837,6 +939,30 @@ commentsCmd
         console.log();
       }
 
+      setLastProject(proj.id);
+    } catch (error: any) {
+      spinner.fail(`Failed: ${error.message}`);
+      process.exit(1);
+    }
+  });
+
+commentsCmd
+  .command('reply <threadId> <body> [project]')
+  .description('Reply to a comment thread with a message')
+  .option('--json', 'Output as JSON')
+  .option('--cookie <session>', 'Session cookie override')
+  .action(async (threadId, body, project, options) => {
+    const spinner = ora('Posting reply...').start();
+    try {
+      const client = await getClient(options.cookie);
+      const proj = await resolveProject(client, project);
+      const message = await client.postCommentMessage(proj.id, threadId, body);
+      if (options.json) {
+        spinner.stop();
+        console.log(JSON.stringify({ replied: true, message }, null, 2));
+        return;
+      }
+      spinner.succeed(`Replied to ${threadId}`);
       setLastProject(proj.id);
     } catch (error: any) {
       spinner.fail(`Failed: ${error.message}`);
@@ -2062,6 +2188,26 @@ configCmd
   .description('Get the current session cookie name')
   .action(() => {
     console.log(getSessionCookieName(selectedProfileName()));
+  });
+
+configCmd
+  .command('set-timeout <ms>')
+  .description('Set the default HTTP request timeout in milliseconds')
+  .action((ms: string) => {
+    const timeout = parseInt(ms, 10);
+    if (isNaN(timeout)) {
+      console.error(chalk.red('Invalid timeout value. Must be a number.'));
+      process.exit(1);
+    }
+    setTimeout(timeout);
+    console.log(chalk.green(`Default timeout set to: ${timeout}ms`));
+  });
+
+configCmd
+  .command('get-timeout')
+  .description('Get the current default HTTP request timeout')
+  .action(() => {
+    console.log(`${getTimeout()}ms`);
   });
 
 program
