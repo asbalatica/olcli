@@ -119,6 +119,8 @@ from that directory use the same profile.
 
 ```bash
 olcli pdf
+# Compile a specific .tex file (for multi-doc projects):
+olcli pdf -r appendix.tex
 ```
 
 ### 4. Or use native git commands
@@ -169,13 +171,15 @@ All commands auto-detect the project when run from a synced directory (contains 
 | `olcli open [project]` | Open a project in your browser |
 | `olcli info [project]` | Show project details and file list |
 | `olcli pull [project] [dir]` | Download project files to local directory |
-| `olcli push [dir]` | Upload local changes to Overleaf |
+| `olcli push [dir]` | Upload local changes to Overleaf (`--delete` also removes files deleted locally) |
 | `olcli sync [dir]` | Bidirectional sync (pull + push) |
 | `olcli clone <project>` | Copy a project between profiles |
-| `olcli upload <file> [project]` | Upload a single file |
+| `olcli upload <file> [project]` | Upload a single file (`--to <path>` sets the remote destination) |
 | `olcli download <file> [project]` | Download a single file |
 | `olcli delete <file> [project]` | Delete a remote file or folder (alias: `rm`) |
 | `olcli rename <old> <new> [project]` | Rename a remote file or folder (alias: `mv`) |
+| `olcli project rename <new> [project]` | Rename the project itself (`--dry-run`) |
+| `olcli project rename-bulk` | Rename many projects by pattern (dry-run unless `--apply`) |
 | `olcli compile [project]` | Trigger PDF compilation |
 | `olcli pdf [project]` | Compile and download PDF |
 | `olcli output [type]` | Download compile output files |
@@ -191,6 +195,16 @@ All commands auto-detect the project when run from a synced directory (contains 
 | `olcli config set-cookie-name <name>` | Set session cookie name |
 | `olcli config set-timeout <ms>` | Set default HTTP timeout |
 | `olcli check` | Show config paths and credential sources |
+
+### Compile Options
+
+The compile-related commands (`compile`, `pdf`, `output`) accept:
+
+| Flag | Description |
+|------|-------------|
+| `-r, --resource <path>` | Compile a specific `.tex` file as the root document (e.g. `appendix.tex`, `folder/test.tex`) |
+
+Useful in multi-doc projects: each `-r` run compiles the file as if it were the main document.
 
 ### Global Options
 
@@ -294,11 +308,18 @@ olcli sync && olcli pdf -o draft.pdf
 # Quick PDF download
 olcli pdf "Conference Paper" -o paper.pdf
 
+# Compile a specific root document
+olcli pdf "Conference Paper" -r appendix.tex -o appendix.pdf
+olcli compile "Conference Paper" -r folder/test.tex
+
 # Upload figures
-olcli upload figures/diagram.png
+olcli upload figures/diagram.png          # relative path is preserved
+olcli upload /tmp/build/diagram.png       # absolute path lands in the project root
+olcli upload /tmp/build/diagram.png --to figures/diagram.png   # explicit destination
 
 # arXiv submission prep
 olcli output bbl -o main.bbl
+olcli output bbl -r folder/test.tex -o main.bbl  # compile artifacts from a specific root doc
 olcli zip -o arxiv-submission.zip
 
 # Backup all projects

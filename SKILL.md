@@ -24,8 +24,8 @@ This package installs `olcli`, `olcli-mcp`, and `git-remote-overleaf`.
 
 - Do not print or repeat session cookies. Prefer `olcli auth`'s hidden prompt.
 - Use `olcli check`, `olcli whoami`, and `olcli profiles show <profile>` for diagnostics.
-- Prefer `--dry-run` before writes: `push`, `sync`, `clone`, and profile-to-profile `pull/push`.
-- Remember that `olcli sync` propagates local deletions to Overleaf unless `--no-delete` is used.
+- Prefer `--dry-run` before writes: `push`, `sync`, `clone`, project renames, and profile-to-profile `pull/push`.
+- Remember that `olcli sync` propagates local deletions to Overleaf unless `--no-delete` is used. `olcli push` only propagates them when `--delete` is passed.
 - Use `--verbose` for failed auth, compile/download 404s, upload placement issues, or unexpected sync behavior.
 - Use `--timeout <ms>` or `olcli config set-timeout <ms>` for slow projects or self-hosted instances.
 
@@ -54,6 +54,8 @@ olcli info [project]
 olcli create "Project Name"
 olcli open [project]
 olcli open [project] --print-url
+olcli project rename "New Name" [project] --dry-run
+olcli project rename-bulk --search "Draft" --replace "Final"
 ```
 
 ```bash
@@ -61,6 +63,7 @@ olcli pull "Project Name" local-dir -p <profile>
 cd local-dir
 olcli push --dry-run
 olcli push
+olcli push --delete --dry-run
 olcli sync --dry-run
 olcli sync --no-delete
 olcli pdf -o draft.pdf
@@ -104,21 +107,29 @@ Debug with `GIT_REMOTE_OVERLEAF_DEBUG=1 git push`.
 
 ```bash
 olcli compile [project]
+olcli compile [project] -r appendix.tex
 olcli pdf [project] -o draft.pdf
+olcli pdf [project] -r appendix.tex
 olcli output --list --project "Project Name"
 olcli output bbl -o main.bbl
 olcli output log -o output.log
 olcli zip [project] -o project.zip
 ```
 
+`-r, --resource <path>` on `compile`, `pdf`, and `output` compiles that `.tex` file as the root document.
+
 ```bash
 olcli upload figures/diagram.png [project]
+olcli upload /tmp/diagram.png [project] --to figures/diagram.png
 olcli download main.tex [project] -o main.tex
 olcli delete chapters/old.tex [project]
 olcli rename old.tex new.tex [project]
 olcli ignored
 olcli push --show-ignored
 ```
+
+A relative upload path keeps its directory part, an absolute path uses its basename,
+and `--to` explicitly sets the remote path.
 
 ## Review Comments
 
@@ -151,3 +162,7 @@ Prefer resolving comments over permanently deleting them unless deletion is expl
   }
 }
 ```
+
+Available MCP tools: `list_projects`, `get_project_info`, `pull_project`, `push_file`, `compile`, `download_pdf`, `list_comments`, `get_entities`, `download_file`, `add_comment`, `reply_to_comment`, `resolve_comment`, `delete_entity`, `rename_entity`, and `compile_with_outputs`.
+
+`compile`, `download_pdf`, and `compile_with_outputs` accept an optional `resource_path` to compile a specific root document.

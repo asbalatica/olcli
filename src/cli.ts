@@ -10,10 +10,12 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { join, dirname, basename, isAbsolute, resolve } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { OverleafClient } from './client.js';
+import { resolveRemotePath } from './paths.js';
+import { planProjectRenames } from './rename-plan.js';
 import {
   loadIgnore,
   shouldIgnore,
@@ -1136,6 +1138,7 @@ program
   .command('pdf [project]')
   .description('Compile and download PDF')
   .option('-o, --output <path>', 'Output path (default: <project-name>.pdf)')
+  .option('-r, --resource <path>', 'Compile this .tex file as root document (e.g. paper.tex, folder/test.tex)')
   .option('--cookie <session>', 'Session cookie override')
   .action(async (project, options) => {
     const spinner = ora('Compiling project...').start();
@@ -1144,7 +1147,7 @@ program
       const proj = await resolveProject(client, project);
 
       spinner.text = 'Compiling...';
-      const pdf = await client.downloadPdf(proj.id);
+      const pdf = await client.downloadPdf(proj.id, undefined, options.resource);
       const outputPath = options.output || `${proj.name.replace(/[^a-zA-Z0-9-_]/g, '_')}.pdf`;
 
       writeFileSync(outputPath, pdf);
@@ -1161,6 +1164,7 @@ program
   .command('output [type]')
   .description('Download compile output files (bbl, log, aux, etc.)')
   .option('-o, --output <path>', 'Output path')
+  .option('-r, --resource <path>', 'Compile this .tex file as root document (e.g. paper.tex, folder/test.tex)')
   .option('--list', 'List available output files')
   .option('--project <name>', 'Project name or ID')
   .option('--cookie <session>', 'Session cookie override')
@@ -1184,10 +1188,10 @@ program
       }
 
       const proj = await resolveProject(client, projectArg);
-      const result = await client.compileWithOutputs(proj.id);
+      const result = await client.compileWithOutputs(proj.id, options.resource);
 
       if (result.status !== 'success') {
-        spinner.warn(`Compilation ${result.status}, but output files may still be available`);
+        spinner.warn(`Compilation ${result.status}, but output files may still be available${result.failureHint ?? ''}`);
       }
 
       if (options.list || !actualType) {
@@ -1231,6 +1235,7 @@ program
 program
   .command('upload <file> [project]')
   .description('Upload a file to a project')
+  .option('--to <path>', 'Destination path within the project (default: derived from <file>)')
   .option('--folder <id>', 'Target folder ID (default: root)')
   .option('--cookie <session>', 'Session cookie override')
   .action(async (file, project, options) => {
@@ -1245,14 +1250,11 @@ program
       }
 
       const content = readFileSync(file);
-      // Preserve the relative path (e.g. 'figures/fig01.png') so the file lands
-      // in the correct subfolder, not in project root. uploadFile() will
-      // lazy-resolve the folder tree when no folderId/tree is supplied.
-      // Normalize: keep relative subfolders, but never send host absolute paths.
-      const fileName = (isAbsolute(file) ? basename(file) : file)
-        .replace(/\\/g, '/')
-        .replace(/^(\.\/)+/, '')
-        .replace(/^\/+/, '');
+      // Derive the remote path: an explicit --to wins, absolute paths collapse
+      // to their basename, relative paths keep their directory part so
+      // 'figures/fig01.png' still lands in the 'figures' folder. uploadFile()
+      // lazy-resolves the folder tree when no folderId/tree is supplied.
+      const fileName = resolveRemotePath(file, options.to);
 
       // Pass folder ID or null for root folder (client will compute it)
       const folderId = options.folder || null;
@@ -1318,12 +1320,157 @@ program
   });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PROJECT COMMANDS (rename the project itself, not files inside it)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const projectCmd = program
+  .command('project')
+  .description('Operate on projects themselves (rename, bulk rename)');
+
+projectCmd
+  .command('rename <newname> [project]')
+  .description('Rename a project')
+  .option('--dry-run', 'Show what would change without applying')
+  .option('--cookie <session>', 'Session cookie override')
+  .action(async (newname, project, options) => {
+    const spinner = ora('Renaming project...').start();
+    try {
+      const client = await getClient(options.cookie);
+      const proj = await resolveProject(client, project);
+
+      if (proj.name === newname) {
+        spinner.info(`Project is already named "${newname}"`);
+        return;
+      }
+
+      if (options.dryRun) {
+        spinner.stop();
+        console.log(chalk.bold('Would rename project:'));
+        console.log(`  ${chalk.cyan(proj.name)} \u2192 ${chalk.cyan(newname)}  ${chalk.dim(`(${proj.id})`)}`);
+        return;
+      }
+
+      await client.renameProject(proj.id, newname);
+      spinner.succeed(`Renamed project: ${proj.name} \u2192 ${newname}`);
+      setLastProject(proj.id);
+    } catch (error: any) {
+      spinner.fail(`Failed: ${error.message}`);
+      process.exit(1);
+    }
+  });
+
+projectCmd
+  .command('rename-bulk')
+  .description('Rename many projects at once by pattern (dry-run unless --apply)')
+  .option('--match <regex>', 'Only consider projects whose name matches this regex')
+  .option('--search <text>', 'Literal substring to replace in the name')
+  .option('--replace <text>', 'Replacement for --search or --match (supports $1, $2 backrefs)')
+  .option('--prefix <text>', 'Prepend this to the name')
+  .option('--suffix <text>', 'Append this to the name')
+  .option('--apply', 'Actually rename. Without this flag nothing is changed.')
+  .option('--max <n>', 'Refuse to apply if more than n projects would change', parseInt)
+  .option('--cookie <session>', 'Session cookie override')
+  .action(async (options) => {
+    // Inverted default on purpose: for a single project a dry-run flag is a
+    // convenience, but a bulk rename that fires on a typo is unrecoverable
+    // (Overleaf keeps no project-name history). So doing nothing is the
+    // default and --apply is the deliberate act.
+    const spinner = ora('Fetching projects...').start();
+    try {
+      const client = await getClient(options.cookie);
+      const projects = await client.listProjects();
+
+      let plan;
+      try {
+        plan = planProjectRenames(projects, {
+          match: options.match,
+          search: options.search,
+          replace: options.replace,
+          prefix: options.prefix,
+          suffix: options.suffix,
+        });
+      } catch (err: any) {
+        spinner.fail(err.message);
+        process.exit(1);
+      }
+
+      const { planned, skipped, collisions } = plan!;
+      spinner.stop();
+
+      if (planned.length === 0) {
+        console.log(chalk.yellow('No project names would change.'));
+        for (const s of skipped) {
+          console.log(chalk.dim(`  skipped ${s.name}: ${s.reason}`));
+        }
+        return;
+      }
+
+      console.log(chalk.bold(`${planned.length} project(s) would be renamed:`));
+      for (const p of planned) {
+        console.log(`  ${chalk.cyan(p.from)} ${chalk.dim('\u2192')} ${chalk.cyan(p.to)}  ${chalk.dim(`(${p.id})`)}`);
+      }
+      for (const s of skipped) {
+        console.log(chalk.dim(`  skipped ${s.name}: ${s.reason}`));
+      }
+
+      if (collisions.length > 0) {
+        console.log();
+        console.log(chalk.red(`Name collisions (${collisions.length}):`));
+        for (const c of collisions) console.log(chalk.red(`  ${c}`));
+        console.log(chalk.red('Refusing to apply. Overleaf allows duplicate names, so this would'));
+        console.log(chalk.red('succeed silently and leave projects you cannot tell apart.'));
+        process.exit(1);
+      }
+
+      if (options.max !== undefined && planned.length > options.max) {
+        console.log();
+        console.log(chalk.red(`Refusing to apply: ${planned.length} changes exceed --max ${options.max}.`));
+        process.exit(1);
+      }
+
+      if (!options.apply) {
+        console.log();
+        console.log(chalk.yellow('Dry run. Nothing was changed. Re-run with --apply to rename.'));
+        return;
+      }
+
+      const applySpinner = ora(`Renaming ${planned.length} project(s)...`).start();
+      let renamed = 0;
+      const failures: { from: string; reason: string }[] = [];
+      for (const p of planned) {
+        try {
+          await client.renameProject(p.id, p.to);
+          renamed++;
+          applySpinner.text = `Renaming... (${renamed}/${planned.length})`;
+        } catch (error: any) {
+          // Keep going: a partial rename is recoverable by re-running, while
+          // aborting midway leaves the same partial state plus no report.
+          failures.push({ from: p.from, reason: error.message || String(error) });
+        }
+      }
+
+      if (failures.length > 0) {
+        applySpinner.warn(`Renamed ${renamed} project(s), ${failures.length} failed`);
+        for (const f of failures) {
+          console.log(chalk.yellow(`  ${f.from}: ${f.reason}`));
+        }
+      } else {
+        applySpinner.succeed(`Renamed ${renamed} project(s)`);
+      }
+    } catch (error: any) {
+      spinner.fail(`Failed: ${error.message}`);
+      process.exit(1);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────────────────────
 // COMPILE COMMAND
 // ─────────────────────────────────────────────────────────────────────────────
 
 program
   .command('compile [project]')
   .description('Compile a project (trigger PDF generation)')
+  .option('-r, --resource <path>', 'Compile this .tex file as root document (e.g. paper.tex, folder/test.tex)')
   .option('--cookie <session>', 'Session cookie override')
   .action(async (project, options) => {
     const spinner = ora('Compiling...').start();
@@ -1331,7 +1478,7 @@ program
       const client = await getClient(options.cookie);
       const proj = await resolveProject(client, project);
 
-      const result = await client.compileProject(proj.id);
+      const result = await client.compileProject(proj.id, options.resource);
       spinner.succeed(`Compiled "${proj.name}"`);
       console.log(chalk.dim(`PDF URL: ${result.pdfUrl}`));
 
@@ -1508,6 +1655,7 @@ program
   .option('--force', 'Overwrite changed files in profile-to-profile push')
   .option('--project <name>', 'Project name or ID (overrides .olcli.json)')
   .option('--all', 'Upload all files (not just changed)')
+  .option('--delete', 'Propagate local deletions to the remote (opt-in; see docs)')
   .option('--dry-run', 'Show what would be uploaded without uploading')
   .option('--probe-folder', 'Probe for correct folder ID (use if uploads fail with folder_not_found)')
   .option('--no-default-ignore', 'Disable built-in LaTeX artifact ignore list (only .olignore applies)')
@@ -1544,12 +1692,21 @@ program
     let lastPull: Date | undefined;
     let rootFolderId: string | undefined;
 
+    let previousPushManifest: string[] = [];
+
     if (existsSync(metaPath)) {
       const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
       projectId = meta.projectId;
       projectName = meta.projectName;
       lastPull = meta.lastPull ? new Date(meta.lastPull) : undefined;
       rootFolderId = meta.rootFolderId;
+      // Written by a previous push (pushManifest) or pull (remoteManifest).
+      // Either is a valid baseline for "what did this directory last put there".
+      if (Array.isArray(meta.pushManifest)) {
+        previousPushManifest = meta.pushManifest as string[];
+      } else if (Array.isArray(meta.remoteManifest)) {
+        previousPushManifest = meta.remoteManifest as string[];
+      }
     }
 
     if (options.project) {
@@ -1595,6 +1752,10 @@ program
 
       const filesToUpload: { path: string; relativePath: string }[] = [];
       const filesIgnored: string[] = [];
+      // Every local file that survives ignore filtering, regardless of mtime.
+      // filesToUpload is mtime-filtered and therefore useless as a deletion
+      // baseline: an unchanged file would look "absent" and get deleted.
+      const allLocalPaths = new Set<string>();
 
       function scanDir(currentDir: string, relativeBase: string = '') {
         const entries = readdirSync(currentDir, { withFileTypes: true });
@@ -1625,6 +1786,7 @@ program
               filesIgnored.push(relativePath);
               continue;
             }
+            allLocalPaths.add(relativePath);
             // Check if file is newer than last pull (unless --all)
             if (options.all || !lastPull) {
               filesToUpload.push({ path: fullPath, relativePath });
@@ -1649,16 +1811,46 @@ program
         spinner.start('Scanning files...');
       }
 
-      if (filesToUpload.length === 0) {
+      // Deletion candidates: tracked by a previous push/pull from THIS directory,
+      // gone locally now. Never derived from the remote listing - that would also
+      // sweep away files someone else uploaded through the Overleaf editor.
+      //
+      // Skipped entirely without a baseline manifest: on a first push we cannot
+      // tell "deleted locally" from "never existed here", and guessing wrong
+      // destroys remote work.
+      const filesToDelete: string[] = [];
+      if (options.delete && previousPushManifest.length > 0) {
+        for (const path of previousPushManifest) {
+          if (path === 'output.pdf' || path.endsWith('/output.pdf')) continue;
+          if (!allLocalPaths.has(path)) filesToDelete.push(path);
+        }
+      }
+      const noBaseline = options.delete === true && previousPushManifest.length === 0;
+
+      if (filesToUpload.length === 0 && filesToDelete.length === 0) {
         spinner.info('No files to upload');
+        if (noBaseline) {
+          console.log(chalk.dim('  --delete skipped: no manifest yet (first push from this directory)'));
+        }
         return;
       }
 
       if (options.dryRun) {
         spinner.stop();
-        console.log(chalk.bold(`Would upload ${filesToUpload.length} file(s) to "${projectName}":`));
-        for (const f of filesToUpload) {
-          console.log(`  ${chalk.cyan(f.relativePath)}`);
+        if (filesToUpload.length > 0) {
+          console.log(chalk.bold(`Would upload ${filesToUpload.length} file(s) to "${projectName}":`));
+          for (const f of filesToUpload) {
+            console.log(`  ${chalk.cyan(f.relativePath)}`);
+          }
+        }
+        if (filesToDelete.length > 0) {
+          console.log(chalk.bold(`Would delete ${filesToDelete.length} file(s) on "${projectName}":`));
+          for (const p of filesToDelete) {
+            console.log(`  ${chalk.red(p)}`);
+          }
+        }
+        if (noBaseline) {
+          console.log(chalk.dim('  --delete skipped: no manifest yet (first push from this directory)'));
         }
         return;
       }
@@ -1713,11 +1905,30 @@ program
         }
       }
 
-      // Update last push time
+      // Deletions run after uploads: a rename arrives as add+remove, and doing
+      // it in this order never leaves the remote without the file.
+      let deleted = 0;
+      const deleteSkipped: { path: string; reason: string }[] = [];
+      if (filesToDelete.length > 0) {
+        spinner.text = `Deleting ${filesToDelete.length} remote file(s)...`;
+        for (const path of filesToDelete) {
+          try {
+            await client.deleteByPath(projectId!, path);
+            deleted++;
+          } catch (error: any) {
+            // Already gone remotely is the common case and not an error worth
+            // failing the push over.
+            deleteSkipped.push({ path, reason: error.message || String(error) });
+          }
+        }
+      }
+
+      // Update last push time and the manifest that the next --delete reads.
       if (existsSync(metaPath)) {
         const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
         meta.profile = metadataProfileField(targetDir);
         meta.lastPush = new Date().toISOString();
+        meta.pushManifest = Array.from(allLocalPaths).sort();
         writeFileSync(metaPath, JSON.stringify(meta, null, 2));
       }
 
@@ -1728,6 +1939,19 @@ program
         }
       } else {
         spinner.succeed(`Uploaded ${uploaded} file(s) to "${projectName}"`);
+      }
+
+      if (deleted > 0) {
+        console.log(chalk.dim(`  ✖ ${deleted} deleted on remote`));
+      }
+      if (deleteSkipped.length > 0) {
+        console.log(chalk.yellow(`  ${deleteSkipped.length} deletion(s) skipped:`));
+        for (const s of deleteSkipped) {
+          console.log(chalk.dim(`    ${s.path}: ${s.reason}`));
+        }
+      }
+      if (noBaseline) {
+        console.log(chalk.dim('  --delete skipped: no manifest yet; next push has a baseline'));
       }
 
       setLastProject(projectId!);
